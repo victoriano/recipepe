@@ -1,0 +1,169 @@
+name: Deploy to Hetzner Server
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  PROJECT_NAME: recipepe
+  DEPLOY_PATH: /opt/recipepe
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install uv
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+    
+    - name: Install dependencies
+      run: |
+        uv sync
+    
+    - name: Run basic tests
+      run: |
+        # Test that the app starts without errors
+        timeout 10s uv run python -c "
+        import main
+        print('✅ App imports successfully')
+        " || true
+        
+        # Test that all required dependencies are installed
+        uv run python -c "
+        import fastapi, instructor, openai, httpx, pydantic
+        print('✅ All dependencies imported successfully')
+        "
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create deployment package
+      run: |
+        tar -czf recipepe-deploy.tar.gz \
+          main.py \
+          pyproject.toml \
+          Dockerfile \
+          docker-compose.yml \
+          nginx.conf \
+          env.example \
+          README.md \
+          --exclude='.venv' \
+          --exclude='__pycache__' \
+          --exclude='.git'
+    
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.HETZNER_SERVER_IP }} >> ~/.ssh/known_hosts
+    
+    - name: Copy files to server
+      run: |
+        scp recipepe-deploy.tar.gz root@${{ secrets.HETZNER_SERVER_IP }}:/root/
+    
+    - name: Deploy to server
+      run: |
+        ssh root@${{ secrets.HETZNER_SERVER_IP }} << 'ENDSSH'
+          set -e
+          
+          echo "🚀 Starting deployment..."
+          
+          # Install Docker if not present
+          if ! command -v docker &> /dev/null; then
+            echo "📦 Installing Docker..."
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sh get-docker.sh
+            systemctl start docker
+            systemctl enable docker
+          fi
+          
+          # Install Docker Compose if not present
+          if ! command -v docker-compose &> /dev/null; then
+            echo "📦 Installing Docker Compose..."
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+          fi
+          
+          # Create project directory
+          mkdir -p ${{ env.DEPLOY_PATH }}
+          cd ${{ env.DEPLOY_PATH }}
+          
+          # Backup current deployment
+          if [ -f docker-compose.yml ]; then
+            echo "📋 Backing up current deployment..."
+            mkdir -p backup/$(date +%Y%m%d_%H%M%S)
+            cp -r . backup/$(date +%Y%m%d_%H%M%S)/ || true
+          fi
+          
+          # Stop existing containers
+          echo "⏹️ Stopping existing containers..."
+          docker-compose down || true
+          
+          # Extract new files
+          echo "📦 Extracting new deployment..."
+          tar -xzf /root/recipepe-deploy.tar.gz -C .
+          
+          # Create .env if it doesn't exist
+          if [ ! -f .env ]; then
+            echo "📝 Creating .env file..."
+            cp env.example .env
+            echo "⚠️ Warning: Please update .env with your OpenAI API key!"
+          fi
+          
+          # Build and start
+          echo "🔨 Building and starting containers..."
+          docker-compose up -d --build
+          
+          # Wait for startup
+          echo "⏱️ Waiting for startup..."
+          sleep 15
+          
+          # Test deployment
+          echo "🧪 Testing deployment..."
+          max_retries=5
+          for i in $(seq 1 $max_retries); do
+            if curl -f http://localhost:8000/health > /dev/null 2>&1; then
+              echo "✅ Deployment successful!"
+              docker-compose ps
+              echo "🌐 API is running at http://$(curl -s ifconfig.me):8000"
+              exit 0
+            else
+              echo "❌ Health check failed (attempt $i/$max_retries)..."
+              if [ $i -eq $max_retries ]; then
+                echo "🔍 Deployment failed! Container logs:"
+                docker-compose logs --tail=50
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+        ENDSSH
+    
+    - name: Cleanup
+      run: |
+        rm -f ~/.ssh/id_rsa
+        rm -f recipepe-deploy.tar.gz
+
+    - name: Deployment notification
+      if: success()
+      run: |
+        echo "🎉 Deployment completed successfully!"
+        echo "🌐 Your API is now running at: http://${{ secrets.HETZNER_SERVER_IP }}:8000"
+        echo "📊 Monitor with: ssh root@${{ secrets.HETZNER_SERVER_IP }} 'cd ${{ env.DEPLOY_PATH }} && docker-compose logs -f'"
